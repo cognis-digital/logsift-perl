@@ -2,7 +2,7 @@
 
 **Perl** — Auth-log brute-force & password-spray detector for SSH/PAM logs.
 
-[![ci](https://github.com/cognis-digital/logsift/actions/workflows/ci.yml/badge.svg)](https://github.com/cognis-digital/logsift/actions/workflows/ci.yml)
+[![ci](https://github.com/cognis-digital/logsift-perl/actions/workflows/ci.yml/badge.svg)](https://github.com/cognis-digital/logsift-perl/actions/workflows/ci.yml)
 ![lang](https://img.shields.io/badge/lang-Perl-informational)
 ![license](https://img.shields.io/badge/license-COCL%201.0-2ea043)
 
