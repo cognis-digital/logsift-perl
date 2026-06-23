@@ -1,0 +1,18 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: perl version
+        run: perl --version
+      - name: run on sample (expect brute_force + spray, exit 2)
+        run: |
+          set +e
+          out=$(perl logsift.pl sample.log); code=$?
+          echo "$out"
+          echo "exit=$code"
+          echo "$out" | grep -q '"type":"brute_force"' || { echo "missing brute_force"; exit 1; }
+          echo "$out" | grep -q '"type":"password_spray"' || { echo "missing spray"; exit 1; }
+          [ "$code" = "2" ] || { echo "expected exit 2"; exit 1; }
