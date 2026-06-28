@@ -8,6 +8,33 @@
 
 Part of the **[Cognis Neural Suite](https://github.com/cognis-digital)** — 370+ single-purpose, self-hostable tools. Like every tool in the suite, `logsift` is single-purpose, emits machine-readable JSON, and exits non-zero when it finds something (CI-friendly).
 
+
+<!-- cognis:example:start -->
+## 🔎 Example output
+
+**Sample result format** _(illustrative values — run on your own data for real findings):_
+
+```
+{
+    "log": [
+        {
+            "timestamp": 1643723400,
+            "level": "INFO",
+            "message": "Started processing request for user 'jane' and item 'book1'",
+            "logger_name": "com.example.app.RequestProcessor"
+        },
+        {
+            "timestamp": 1643723410,
+            "level": "ERROR",
+            "message": "Failed to retrieve data for user 'jane' and item 'book1': java.io.IOException: File not found",
+            "logger_name": "com.example.app.DataRetriever"
+        }
+    ]
+}
+```
+
+<!-- cognis:example:end -->
+
 ## Build / run
 
 ```bash
