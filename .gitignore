@@ -3,3 +3,10 @@ bin/
 *.o
 a.out
 *.bin
+# test / bench scratch artifacts
+t/clean_*.log
+t/stdin_*.log
+t/g_*.log.gz
+bench/bench_*.log
+out.json
+out.cef
