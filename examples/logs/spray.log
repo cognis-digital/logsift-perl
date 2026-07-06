@@ -1,0 +1,7 @@
+Jun 22 11:00:01 dc01 sshd[900]: Failed password for alice from 203.0.113.55 port 40001 ssh2
+Jun 22 11:00:11 dc01 sshd[901]: Failed password for bob from 203.0.113.55 port 40002 ssh2
+Jun 22 11:00:21 dc01 sshd[902]: Failed password for carol from 203.0.113.55 port 40003 ssh2
+Jun 22 11:00:31 dc01 sshd[903]: Failed password for dave from 203.0.113.55 port 40004 ssh2
+Jun 22 11:00:41 dc01 sshd[904]: Failed password for erin from 203.0.113.55 port 40005 ssh2
+Jun 22 11:00:51 dc01 sshd[905]: Failed password for frank from 203.0.113.55 port 40006 ssh2
+Jun 22 11:01:01 dc01 sshd[906]: Failed password for grace from 203.0.113.55 port 40007 ssh2

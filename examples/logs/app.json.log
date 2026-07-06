@@ -1,0 +1,5 @@
+{"timestamp":"2026-06-22T13:00:01Z","level":"INFO","message":"service started","host":"api01"}
+{"timestamp":"2026-06-22T13:00:05Z","level":"WARN","message":"slow query 1200ms","host":"api01"}
+{"timestamp":"2026-06-22T13:00:09Z","level":"ERROR","message":"db connection refused 10.1.2.3","host":"api01"}
+{"timestamp":"2026-06-22T13:00:12Z","level":"INFO","message":"login attempt","user":"alice","src_ip":"198.51.100.7","status":200}
+{"timestamp":"2026-06-22T13:00:15Z","level":"CRIT","message":"disk full /var","host":"api01"}

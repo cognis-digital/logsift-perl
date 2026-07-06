@@ -1,18 +1,56 @@
 name: ci
 on: [push, pull_request]
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - name: perl version
         run: perl --version
-      - name: run on sample (expect brute_force + spray, exit 2)
+
+      - name: syntax check all files
+        run: |
+          perl -c logsift.pl
+          perl -Ilib -c lib/Logsift/Parser.pm
+          perl -Ilib -c lib/Logsift/Detectors.pm
+          perl -Ilib -c lib/Logsift/Output.pm
+
+      - name: core modules present (no CPAN needed)
+        run: perl -MJSON::PP -MIO::Uncompress::Gunzip -MIO::Compress::Gzip -e 'print "core deps OK\n"'
+
+      - name: run test suite
+        run: prove -Ilib -It t/
+
+      - name: run all demos (must exit 0)
+        run: sh examples/run_all.sh
+
+      - name: validate JSON output parses
+        run: |
+          # logsift exits 2 when it finds something (by design); tolerate it here.
+          perl logsift.pl --format json examples/logs/auth.log > out.json || true
+          perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<STDIN>); die "no findings" unless @{$d->{findings}}; print "json ok: ", scalar(@{$d->{findings}}), " findings\n"' < out.json
+
+      - name: validate CEF output is well-formed
+        run: |
+          perl logsift.pl --format cef examples/logs/auth.log > out.cef || true
+          grep -qE '^CEF:0\|Cognis\|logsift\|' out.cef || { echo "malformed CEF"; exit 1; }
+          grep -q 'cs1=T1110.001' out.cef || { echo "missing ATT&CK tag in CEF"; exit 1; }
+          echo "cef ok"
+
+      - name: exit contract (findings -> 2, clean -> 0)
         run: |
           set +e
-          out=$(perl logsift.pl sample.log); code=$?
-          echo "$out"
-          echo "exit=$code"
-          echo "$out" | grep -q '"type":"brute_force"' || { echo "missing brute_force"; exit 1; }
-          echo "$out" | grep -q '"type":"password_spray"' || { echo "missing spray"; exit 1; }
-          [ "$code" = "2" ] || { echo "expected exit 2"; exit 1; }
+          perl logsift.pl examples/logs/auth.log > /dev/null; code=$?
+          [ "$code" = "2" ] || { echo "expected exit 2 on findings, got $code"; exit 1; }
+          printf 'Jun 22 10:00:01 h sshd[1]: Accepted password for alice from 10.0.0.7 port 22 ssh2\nJun 22 10:00:02 h sshd[1]: Accepted password for alice from 10.0.0.7 port 22 ssh2\nJun 22 10:00:03 h sshd[1]: Accepted password for alice from 10.0.0.7 port 22 ssh2\n' | perl logsift.pl - > /dev/null; code=$?
+          [ "$code" = "0" ] || { echo "expected exit 0 on clean, got $code"; exit 1; }
+          echo "exit contract ok"
+
+      - name: benchmark (smoke; prints honest throughput)
+        run: perl bench/bench.pl 50000

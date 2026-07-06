@@ -1,92 +1,247 @@
 #!/usr/bin/env perl
-# logsift — auth-log brute-force / password-spray detector (Perl)
-# Part of the Cognis Neural Suite. Single-purpose, JSON-out, CI-tested.
-#
-# Reads syslog/auth.log-style lines from FILE or stdin and flags:
-#   - brute force : many failed logins from ONE source IP
-#   - spray       : ONE source IP failing against MANY distinct users
-# Recognizes OpenSSH "Failed password for [invalid user] <user> from <ip>".
-#
-# Usage:
-#   logsift /var/log/auth.log
-#   journalctl -u ssh | logsift -
-# Options:
-#   --fail-threshold N   min failures from one IP to flag brute force (default 5)
-#   --spray-threshold N  min distinct users from one IP to flag spray  (default 5)
-#
-# Output: JSON summary on stdout. Exit 2 if any finding, else 0.
 use strict;
 use warnings;
+use FindBin qw($RealBin);
+use lib "$RealBin/lib";
+use Logsift::Parser  qw(parse_line detect_format);
+use Logsift::Detectors ();
+use Logsift::Output  qw(render);
 
-my $fail_threshold  = 5;
-my $spray_threshold = 5;
+our $VERSION = '2.0.0';
+
+# ---------------------------------------------------------------------------
+# CLI parsing (hand-rolled; core-only, no Getopt dependency surprises).
+# ---------------------------------------------------------------------------
+my %opt = (
+    format        => 'json',    # output format
+    input_format  => 'auto',    # parser
+    fail_threshold  => 5,
+    spray_threshold => 5,
+    scan_paths      => 15,
+    error_burst     => 20,
+    rare_max        => 2,
+    bucket          => 60,
+    spike_sigma     => 3.0,
+);
 my @files;
+my @allowlist;
+my ($since, $until);
+
+sub parse_time_spec {
+    my ($s) = @_;
+    return undef unless defined $s;
+    return $s + 0 if $s =~ /^\d+$/;                     # epoch
+    if ($s =~ /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})$/) {
+        require POSIX;
+        return POSIX::mktime($6,$5,$4,$3,$2-1,$1-1900);
+    }
+    die "logsift: cannot parse time '$s' (use epoch or YYYY-MM-DDTHH:MM:SS)\n";
+}
+
+sub usage {
+    print <<"EOF";
+logsift $VERSION - dependency-free log triage & SIEM-ready findings
+
+Usage:
+  logsift [options] FILE [FILE...]      # .gz auto-detected
+  cat auth.log | logsift [options] -    # read stdin
+
+Input:
+  --format-in NAME   parser: auto|json|syslog3164|syslog5424|nginx|apache|generic
+  --since SPEC       only events at/after SPEC (epoch or YYYY-MM-DDTHH:MM:SS)
+  --until SPEC       only events at/before SPEC
+
+Output:
+  --format NAME      json (default) | ndjson | cef | text
+
+Detectors / thresholds:
+  --fail-threshold N   brute-force: min failed logins per source IP (5)
+  --spray-threshold N  spray: min distinct users per source IP (5)
+  --scan-paths N       http scan: min distinct paths per IP (15)
+  --error-burst N      http error burst: min 4xx/5xx per IP (20)
+  --rare-max N         rare signature: report signatures seen <= N times (2)
+  --bucket SECONDS     rate-spike time bucket width (60)
+  --spike-sigma F      rate-spike threshold = mean + F*stddev (3.0)
+  --allowlist-ip IP    suppress detections for this IP (repeatable)
+
+Other:
+  -h, --help           this help
+  --version            print version
+
+Exit: 0 clean, 2 findings present, 1 error.
+Docs: perldoc logsift.pl
+EOF
+    exit 0;
+}
+
 while (@ARGV) {
     my $a = shift @ARGV;
-    if    ($a eq '--fail-threshold')  { $fail_threshold  = shift @ARGV; }
-    elsif ($a eq '--spray-threshold') { $spray_threshold = shift @ARGV; }
-    elsif ($a eq '-h' or $a eq '--help') {
-        print STDERR "usage: logsift [--fail-threshold N] [--spray-threshold N] FILE|-\n"; exit 0;
-    }
-    else { push @files, $a; }
+    if    ($a eq '--format')          { $opt{format} = shift @ARGV; }
+    elsif ($a eq '--format-in')       { $opt{input_format} = shift @ARGV; }
+    elsif ($a eq '--fail-threshold')  { $opt{fail_threshold}  = 0 + shift @ARGV; }
+    elsif ($a eq '--spray-threshold') { $opt{spray_threshold} = 0 + shift @ARGV; }
+    elsif ($a eq '--scan-paths')      { $opt{scan_paths}      = 0 + shift @ARGV; }
+    elsif ($a eq '--error-burst')     { $opt{error_burst}     = 0 + shift @ARGV; }
+    elsif ($a eq '--rare-max')        { $opt{rare_max}        = 0 + shift @ARGV; }
+    elsif ($a eq '--bucket')          { my $b = shift @ARGV; $b =~ s/s$//; $opt{bucket} = 0 + $b; }
+    elsif ($a eq '--spike-sigma')     { $opt{spike_sigma}     = 0 + shift @ARGV; }
+    elsif ($a eq '--allowlist-ip')    { push @allowlist, shift @ARGV; }
+    elsif ($a eq '--since')           { $since = parse_time_spec(shift @ARGV); }
+    elsif ($a eq '--until')           { $until = parse_time_spec(shift @ARGV); }
+    elsif ($a eq '--version')         { print "logsift $VERSION\n"; exit 0; }
+    elsif ($a eq '-h' or $a eq '--help') { usage(); }
+    elsif ($a eq '-')                 { push @files, '-'; }
+    elsif ($a =~ /^--/)               { print STDERR "logsift: unknown option $a\n"; exit 1; }
+    else                              { push @files, $a; }
 }
 
-my (%fail_by_ip, %users_by_ip, $total_fail, $total_lines);
+my %valid_out = map { $_ => 1 } qw(json ndjson cef text);
+unless ($valid_out{ $opt{format} }) {
+    print STDERR "logsift: unknown output format '$opt{format}'\n"; exit 1;
+}
 
-sub feed {
+my $engine = Logsift::Detectors->new(
+    fail_threshold  => $opt{fail_threshold},
+    spray_threshold => $opt{spray_threshold},
+    scan_paths      => $opt{scan_paths},
+    error_burst     => $opt{error_burst},
+    rare_max        => $opt{rare_max},
+    bucket          => $opt{bucket},
+    spike_sigma     => $opt{spike_sigma},
+    allowlist       => \@allowlist,
+);
+
+# ---------------------------------------------------------------------------
+# Open a source: '-' = stdin, *.gz = gunzip stream, else plain file.
+# Returns a filehandle (streamed, never slurped).
+# ---------------------------------------------------------------------------
+sub open_source {
+    my ($path) = @_;
+    if ($path eq '-') { return \*STDIN; }
+    if ($path =~ /\.gz$/i) {
+        require IO::Uncompress::Gunzip;
+        no warnings 'once';
+        my $z = IO::Uncompress::Gunzip->new($path)
+            or die "logsift: cannot gunzip $path: $IO::Uncompress::Gunzip::GunzipError\n";
+        return $z;
+    }
+    open(my $fh, '<', $path) or die "logsift: cannot open $path: $!\n";
+    return $fh;
+}
+
+sub feed_fh {
     my ($fh) = @_;
-    while (my $line = <$fh>) {
-        $total_lines++;
-        # OpenSSH failed password
-        if ($line =~ /Failed password for (?:invalid user )?(\S+) from (\d{1,3}(?:\.\d{1,3}){3})/) {
-            my ($user, $ip) = ($1, $2);
-            $fail_by_ip{$ip}++;
-            $users_by_ip{$ip}{$user} = 1;
-            $total_fail++;
+    while (defined(my $line = <$fh>)) {
+        my $ev = parse_line($line, $opt{input_format});
+        if (defined $ev->{ts}) {
+            next if defined $since && $ev->{ts} < $since;
+            next if defined $until && $ev->{ts} > $until;
         }
-        # generic "authentication failure ... rhost=<ip> user=<user>"
-        elsif ($line =~ /authentication failure/ && $line =~ /rhost=(\d{1,3}(?:\.\d{1,3}){3})/) {
-            my $ip = $1;
-            my $user = ($line =~ /user=(\S+)/) ? $1 : '?';
-            $fail_by_ip{$ip}++;
-            $users_by_ip{$ip}{$user} = 1;
-            $total_fail++;
+        $engine->feed($ev);
+    }
+}
+
+eval {
+    if (@files) {
+        for my $f (@files) {
+            my $fh = open_source($f);
+            feed_fh($fh);
+            close($fh) unless $f eq '-';
         }
+    } else {
+        feed_fh(\*STDIN);
     }
-}
+    1;
+} or do {
+    print STDERR $@;
+    exit 1;
+};
 
-if (@files) {
-    for my $f (@files) {
-        if ($f eq '-') { feed(\*STDIN); next; }
-        open(my $fh, '<', $f) or do { print STDERR "logsift: cannot open $f: $!\n"; exit 1; };
-        feed($fh);
-        close($fh);
-    }
-} else {
-    feed(\*STDIN);
-}
+my @findings  = $engine->finish;
+my $stats     = $engine->stats;
+my @top_sigs  = $engine->top_signatures;
 
-my @findings;
-for my $ip (sort { $fail_by_ip{$b} <=> $fail_by_ip{$a} } keys %fail_by_ip) {
-    my $fails = $fail_by_ip{$ip};
-    my $nusers = scalar keys %{ $users_by_ip{$ip} };
-    if ($fails >= $fail_threshold) {
-        push @findings, { type => 'brute_force', ip => $ip, failures => $fails, distinct_users => $nusers };
-    }
-    if ($nusers >= $spray_threshold) {
-        push @findings, { type => 'password_spray', ip => $ip, failures => $fails, distinct_users => $nusers };
-    }
-}
-
-# tiny dependency-free JSON emitter
-sub jstr { my $s = shift; $s =~ s/(["\\])/\\$1/g; return "\"$s\""; }
-sub emit_finding {
-    my $f = shift;
-    return sprintf('{"type":%s,"ip":%s,"failures":%d,"distinct_users":%d}',
-        jstr($f->{type}), jstr($f->{ip}), $f->{failures}, $f->{distinct_users});
-}
-print '{"tool":"logsift",';
-printf '"lines_scanned":%d,"failed_logins":%d,"sources":%d,', $total_lines, ($total_fail//0), scalar(keys %fail_by_ip);
-print '"findings":[' . join(',', map { emit_finding($_) } @findings) . "]}\n";
+print render(\@findings, $stats, \@top_sigs, $opt{format});
 
 exit(@findings ? 2 : 0);
+
+__END__
+
+=head1 NAME
+
+logsift - dependency-free log triage & SIEM-ready detection engine
+
+=head1 SYNOPSIS
+
+  logsift [options] FILE [FILE...]
+  cat /var/log/auth.log | logsift -
+  logsift --format cef --format-in nginx access.log
+
+=head1 DESCRIPTION
+
+SOC and DFIR analysts drown in raw logs. C<logsift> is a fast, pure-Perl
+first-pass triage tool: it parses common log formats into a normalized event
+model, runs a battery of streaming detectors, and emits SIEM-ready findings.
+
+It has zero non-core dependencies (JSON::PP and IO::Uncompress::Gunzip ship
+with Perl 5.14+), streams input line-by-line (never slurps), and returns a
+CI-friendly exit code.
+
+=head2 Input formats (--format-in)
+
+=over 4
+
+=item * B<auto> - per-line format detection (default)
+
+=item * B<syslog3164> - RFC 3164 BSD syslog ("Mon DD HH:MM:SS host prog[pid]: msg")
+
+=item * B<syslog5424> - RFC 5424 syslog ("<PRI>VERSION TS HOST APP PROCID MSGID SD MSG")
+
+=item * B<nginx> / B<apache> - combined access logs
+
+=item * B<json> - one JSON object per line (JSON::PP)
+
+=item * B<generic> - bare lines (e.g. raw OpenSSH output)
+
+=back
+
+=head2 Detectors
+
+=over 4
+
+=item * B<brute_force> - many failed logins from one source IP (ATT&CK T1110.001)
+
+=item * B<password_spray> - one IP against many distinct users (ATT&CK T1110.003)
+
+=item * B<http_scan> - one IP requesting many distinct paths
+
+=item * B<http_error_burst> - burst of 4xx/5xx from one IP
+
+=item * B<rate_spike> - time buckets exceeding mean + N*stddev of event rate
+
+=item * B<rare_signature> - message templates ("signatures") seen <= N times
+
+=back
+
+=head2 Output formats (--format)
+
+C<json> (default), C<ndjson> (one finding per line), C<cef>
+(ArcSight Common Event Format), C<text> (human summary table).
+
+=head2 MITRE ATT&CK
+
+Findings are tagged with ATT&CK technique IDs B<only> where the mapping is
+defensible (brute force, spraying, valid-account bursts). Generic spikes and
+rare signatures are deliberately left untagged. See F<docs/ARCHITECTURE.md>.
+
+=head1 EXIT STATUS
+
+  0  clean (no findings)
+  2  one or more findings
+  1  error (bad option, unreadable file)
+
+=head1 LICENSE
+
+COCL 1.0. Commercial use: licensing@cognis.digital
+
+=cut
