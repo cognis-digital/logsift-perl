@@ -32,12 +32,13 @@ jobs:
 
       - name: validate JSON output parses
         run: |
-          perl logsift.pl --format json examples/logs/auth.log > out.json
+          # logsift exits 2 when it finds something (by design); tolerate it here.
+          perl logsift.pl --format json examples/logs/auth.log > out.json || true
           perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<STDIN>); die "no findings" unless @{$d->{findings}}; print "json ok: ", scalar(@{$d->{findings}}), " findings\n"' < out.json
 
       - name: validate CEF output is well-formed
         run: |
-          perl logsift.pl --format cef examples/logs/auth.log > out.cef
+          perl logsift.pl --format cef examples/logs/auth.log > out.cef || true
           grep -qE '^CEF:0\|Cognis\|logsift\|' out.cef || { echo "malformed CEF"; exit 1; }
           grep -q 'cs1=T1110.001' out.cef || { echo "missing ATT&CK tag in CEF"; exit 1; }
           echo "cef ok"
